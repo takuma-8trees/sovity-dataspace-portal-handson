@@ -1,0 +1,162 @@
+name: dataspace-portal-local
+
+services:
+  keycloak_db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD}
+    volumes:
+      - keycloak-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.4
+    restart: unless-stopped
+    command: start-dev
+    depends_on:
+      keycloak_db:
+        condition: service_healthy
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Set KEYCLOAK_ADMIN_PASSWORD}
+
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD}
+
+      # Browser とコンテナ双方から同じURLでアクセスできるよう、固定のhostnameを使う
+      KC_HOSTNAME: ${KEYCLOAK_PUBLIC_URL:?Set KEYCLOAK_PUBLIC_URL}
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME_STRICT: "false"
+    ports:
+      - "127.0.0.1:28081:8080"
+
+  reverse_proxy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:28080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+
+  portal_db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: portal
+      POSTGRES_USER: portal
+      POSTGRES_PASSWORD: ${PORTAL_DB_PASSWORD:?Set PORTAL_DB_PASSWORD}
+    volumes:
+      - portal-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal -d portal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  portal_backend:
+    image: ghcr.io/sovity/ds-portal-ce-backend:7.3.2
+    restart: unless-stopped
+    depends_on:
+      portal_db:
+        condition: service_healthy
+    environment:
+      quarkus.datasource.jdbc.url: jdbc:postgresql://portal_db:5432/portal
+      quarkus.datasource.username: portal
+      quarkus.datasource.password: ${PORTAL_DB_PASSWORD:?Set PORTAL_DB_PASSWORD}
+
+      # OAuth2 Proxy から届くトークンのissuerと一致させる（Keycloakの公開URL）
+      quarkus.oidc.auth-server-url: ${KEYCLOAK_PUBLIC_URL:?Set KEYCLOAK_PUBLIC_URL}/realms/authority-portal
+
+      # Backend が Keycloak を管理するためのURL（公開URLを使う）
+      quarkus.keycloak.admin-client.server-url: ${KEYCLOAK_PUBLIC_URL:?Set KEYCLOAK_PUBLIC_URL}
+      quarkus.keycloak.admin-client.realm: authority-portal
+      quarkus.keycloak.admin-client.client-id: authority-portal-client
+      quarkus.keycloak.admin-client.client-secret: ${PORTAL_ADMIN_CLIENT_SECRET:?Set PORTAL_ADMIN_CLIENT_SECRET}
+      quarkus.keycloak.admin-client.grant-type: CLIENT_CREDENTIALS
+
+      authority-portal.base-url: ${PORTAL_URL:?Set PORTAL_URL}
+      authority-portal.config.api-key: ${PORTAL_CONFIG_API_KEY:?Set PORTAL_CONFIG_API_KEY}
+      authority-portal.invitation.expiration: "43200"
+      quarkus.log.level: INFO
+
+      # CaaS連携は使用しない
+      quarkus.oidc-client.sovity.client-enabled: "false"
+      authority-portal.caas.sovity.url: http://caas-not-configured.invalid
+      authority-portal.caas.sovity.limit-per-organization: "0"
+
+      # 試験環境
+      authority-portal.deployment.environments.test.title: "Test - DAPS not configured"
+      authority-portal.deployment.environments.test.position: "0"
+      authority-portal.deployment.environments.test.data-catalog.hide-offline-data-offers-after: "15m"
+      authority-portal.deployment.environments.test.data-catalog.catalog-page-page-size: "10"
+      authority-portal.deployment.environments.test.data-catalog.dataspace-names.default: "local test"
+
+      # 起動確認用の仮値。DAPS連携はまだ使用できない
+      authority-portal.deployment.environments.test.daps.url: http://daps-not-configured.invalid
+      authority-portal.deployment.environments.test.daps.realm-name: DAPS
+      authority-portal.deployment.environments.test.daps.client-id: not-configured
+      authority-portal.deployment.environments.test.daps.client-secret: not-configured
+
+  portal_frontend:
+    image: ghcr.io/sovity/ds-portal-ce-frontend:7.3.2
+    restart: unless-stopped
+    environment:
+      AUTHORITY_PORTAL_FRONTEND_BACKEND_URL: "${PORTAL_URL:?Set PORTAL_URL}"
+      AUTHORITY_PORTAL_FRONTEND_LOGIN_URL: "${PORTAL_URL:?Set PORTAL_URL}/oauth2/start?rd=%2F"
+      AUTHORITY_PORTAL_FRONTEND_LOGOUT_URL: "${PORTAL_URL:?Set PORTAL_URL}/oauth2/sign_out"
+      AUTHORITY_PORTAL_FRONTEND_INVALIDATE_SESSION_COOKIES_URL: "${PORTAL_URL:?Set PORTAL_URL}/oauth2/sign_out"
+      AUTHORITY_PORTAL_FRONTEND_UPDATE_PASSWORD_URL: "${KEYCLOAK_PUBLIC_URL:?Set KEYCLOAK_PUBLIC_URL}/realms/authority-portal/protocol/openid-connect/auth?response_type=code&client_id=oauth2-proxy&scope=openid&kc_action=UPDATE_PASSWORD&redirect_uri=${PORTAL_URL_ENCODED:?Set PORTAL_URL_ENCODED}%2Foauth2%2Fcallback"
+      AUTHORITY_PORTAL_FRONTEND_ACTIVE_PROFILE: sovity-open-source
+      AUTHORITY_PORTAL_FRONTEND_DATASPACE_SHORT_NAME: local
+      AUTHORITY_PORTAL_FRONTEND_PORTAL_DISPLAY_NAME: Local Dataspace Portal
+      AUTHORITY_PORTAL_FRONTEND_ENABLE_DASHBOARD: "false"
+      AUTHORITY_PORTAL_FRONTEND_USE_FAKE_BACKEND: "false"
+      AUTHORITY_PORTAL_FRONTEND_LEGAL_NOTICE_URL: "${PORTAL_URL:?Set PORTAL_URL}/test-info"
+      AUTHORITY_PORTAL_FRONTEND_PRIVACY_POLICY_URL: "${PORTAL_URL:?Set PORTAL_URL}/test-info"
+      AUTHORITY_PORTAL_FRONTEND_SUPPORT_URL: "${PORTAL_URL:?Set PORTAL_URL}/test-info"
+
+  portal_oauth2_proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.4
+    restart: unless-stopped
+    environment:
+      OAUTH2_PROXY_PROVIDER: keycloak-oidc
+      OAUTH2_PROXY_PROVIDER_DISPLAY_NAME: Keycloak
+      OAUTH2_PROXY_OIDC_ISSUER_URL: "${KEYCLOAK_PUBLIC_URL:?Set KEYCLOAK_PUBLIC_URL}/realms/authority-portal"
+      OAUTH2_PROXY_CLIENT_ID: oauth2-proxy
+      OAUTH2_PROXY_CLIENT_SECRET: "${PORTAL_OAUTH2_CLIENT_SECRET:?Set PORTAL_OAUTH2_CLIENT_SECRET}"
+      OAUTH2_PROXY_COOKIE_SECRET: "${PORTAL_COOKIE_SECRET:?Set PORTAL_COOKIE_SECRET}"
+      OAUTH2_PROXY_COOKIE_NAME: _portal_oauth2
+      OAUTH2_PROXY_COOKIE_SECURE: "false"
+      OAUTH2_PROXY_COOKIE_REFRESH: 30s
+      OAUTH2_PROXY_COOKIE_EXPIRE: 30m
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_HTTP_ADDRESS: "0.0.0.0:4180"
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_UPSTREAMS: "http://reverse_proxy:8081/"
+      OAUTH2_PROXY_API_ROUTES: "^/api/"
+      OAUTH2_PROXY_SKIP_AUTH_ROUTES: "^(/oauth2/|/api/registration(/|$)|/api/config(/|$))"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_REDIRECT_URL: "${PORTAL_URL:?Set PORTAL_URL}/oauth2/callback"
+      OAUTH2_PROXY_SCOPE: "openid profile email"
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+
+  mailpit:
+    image: axllent/mailpit:v1.27.4
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:28025:8025"
+
+volumes:
+  keycloak-db:
+  portal-db:
+

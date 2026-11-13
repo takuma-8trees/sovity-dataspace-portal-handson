@@ -1,0 +1,25 @@
+:80 {
+    # Dataspace Portal (Frontend + API)
+    handle /test-info {
+        respond "Local test environment. Legal/privacy/support pages are not configured." 200
+    }
+
+    @portal_backend_paths path /api /api/* /oauth2 /oauth2/*
+    handle @portal_backend_paths {
+        reverse_proxy portal_oauth2_proxy:4180
+    }
+
+    handle {
+        reverse_proxy portal_frontend:8080
+    }
+
+    respond /health 200
+}
+
+# Backend: oauth2-proxy が upstream として叩く
+:8081 {
+    reverse_proxy portal_backend:8080 {
+        header_up Authorization "Bearer {http.request.header.X-Forwarded-Access-Token}"
+    }
+}
+
